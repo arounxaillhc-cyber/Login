@@ -213,12 +213,19 @@ jobs:
                   }
                   // ถ้าหน้าต่างเลือกบัญชีโผล่มาอีก ห้ามกดปุ่มสีเทา (มันจะออกจากบัญชีอีกรอบ) ให้รอก่อน
                   if (findByText(root, listOf("ใช้บัญชีใหม่ล็อกอิน"), false) != null) return
+                  // หลังสลับบัญชี หน้าประกาศจะขึ้นอีกรอบ: ปิดประกาศก่อน แล้วค่อยกดเข้าเกม (ทำ 2 รอบกันพลาด)
                   if (enterTaps == 0 && t >= 5000) {
-                      enterGame(root)
+                      tapFraction(CLOSE_X, CLOSE_Y)
                       enterTaps = 1
-                  } else if (enterTaps == 1 && t >= 12000) {
+                  } else if (enterTaps == 1 && t >= 7000) {
                       enterGame(rootInActiveWindow ?: root)
                       enterTaps = 2
+                  } else if (enterTaps == 2 && t >= 13000) {
+                      tapFraction(CLOSE_X, CLOSE_Y)
+                      enterTaps = 3
+                  } else if (enterTaps == 3 && t >= 14500) {
+                      enterGame(rootInActiveWindow ?: root)
+                      enterTaps = 4
                       stage = Stage.DONE
                   }
               }
@@ -310,23 +317,31 @@ jobs:
           import android.os.Bundle
           import android.provider.Settings
           import android.text.InputType
+          import android.view.View
+          import android.widget.AdapterView
+          import android.widget.ArrayAdapter
           import android.widget.Button
           import android.widget.CheckBox
           import android.widget.EditText
           import android.widget.LinearLayout
           import android.widget.ScrollView
+          import android.widget.Spinner
           import android.widget.TextView
           import android.widget.Toast
           import androidx.appcompat.app.AppCompatActivity
           import androidx.security.crypto.EncryptedSharedPreferences
           import androidx.security.crypto.MasterKey
+          import org.json.JSONArray
+          import org.json.JSONObject
 
           object Store {
               // เกมเวอร์ชัน SEA (ไทย)
               const val GAME_PACKAGE = "com.onepunchman.ggplay.sea"
 
-              class Saved(
-                  val user: String, val pass: String,
+              class Account(val user: String, val pass: String)
+
+              class Prefs(
+                  val accounts: List<Account>, val lastUser: String,
                   val remember: Boolean, val encrypt: Boolean, val delaySec: Int
               )
 
@@ -339,45 +354,60 @@ jobs:
                   EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
               )
 
-              fun load(c: Context): Saved {
-                  val s = plain(c)
-                  val encrypt = s.getBoolean("encrypt", true)
-                  val remember = s.getBoolean("remember", true)
-                  var u = ""
-                  var p = ""
-                  if (remember) {
-                      if (encrypt) {
-                          runCatching {
-                              val e = enc(c)
-                              u = e.getString("u", "") ?: ""
-                              p = e.getString("p", "") ?: ""
-                          }
-                      } else {
-                          u = s.getString("u", "") ?: ""
-                          p = s.getString("p", "") ?: ""
-                      }
-                  }
-                  return Saved(u, p, remember, encrypt, s.getInt("delay", 20))
+              private fun toJson(list: List<Account>): String {
+                  val a = JSONArray()
+                  for (x in list) a.put(JSONObject().put("u", x.user).put("p", x.pass))
+                  return a.toString()
               }
 
-              fun save(c: Context, user: String, pass: String, remember: Boolean, encrypt: Boolean, delaySec: Int) {
-                  val e = plain(c).edit()
-                  e.putBoolean("remember", remember).putBoolean("encrypt", encrypt).putInt("delay", delaySec)
-                  e.remove("u").remove("p")
-                  runCatching { enc(c).edit().clear().apply() }
-                  if (remember) {
-                      if (encrypt) {
-                          runCatching { enc(c).edit().putString("u", user).putString("p", pass).apply() }
-                      } else {
-                          e.putString("u", user).putString("p", pass)
+              private fun fromJson(s: String?): List<Account> {
+                  if (s.isNullOrEmpty()) return emptyList()
+                  return try {
+                      val a = JSONArray(s)
+                      (0 until a.length()).map {
+                          val o = a.getJSONObject(it)
+                          Account(o.getString("u"), o.getString("p"))
                       }
+                  } catch (e: Exception) {
+                      emptyList()
+                  }
+              }
+
+              fun load(c: Context): Prefs {
+                  val s = plain(c)
+                  val encrypt = s.getBoolean("encrypt", true)
+                  val json: String? = if (encrypt) {
+                      try { enc(c).getString("accounts", null) } catch (e: Exception) { null }
+                  } else {
+                      s.getString("accounts", null)
+                  }
+                  return Prefs(
+                      fromJson(json), s.getString("last", "") ?: "",
+                      s.getBoolean("remember", true), encrypt, s.getInt("delay", 20)
+                  )
+              }
+
+              // เก็บรายการบัญชีทั้งหมด: encrypt = true -> เข้ารหัส, false -> เก็บเป็นข้อความธรรมดา
+              fun saveAccounts(c: Context, list: List<Account>, encrypt: Boolean) {
+                  val e = plain(c).edit()
+                  e.putBoolean("encrypt", encrypt)
+                  e.remove("accounts")
+                  try { enc(c).edit().remove("accounts").apply() } catch (ex: Exception) {}
+                  val json = toJson(list)
+                  if (encrypt) {
+                      try { enc(c).edit().putString("accounts", json).apply() } catch (ex: Exception) {}
+                  } else {
+                      e.putString("accounts", json)
                   }
                   e.apply()
               }
 
-              fun clear(c: Context) {
-                  plain(c).edit().remove("u").remove("p").apply()
-                  runCatching { enc(c).edit().clear().apply() }
+              fun saveSettings(c: Context, remember: Boolean, delaySec: Int, lastUser: String) {
+                  plain(c).edit()
+                      .putBoolean("remember", remember)
+                      .putInt("delay", delaySec)
+                      .putString("last", lastUser)
+                      .apply()
               }
           }
 
@@ -386,16 +416,16 @@ jobs:
               override fun onCreate(savedInstanceState: Bundle?) {
                   super.onCreate(savedInstanceState)
                   val saved = Store.load(this)
+                  val accounts = saved.accounts.toMutableList()
 
+                  val spinner = Spinner(this)
                   val user = EditText(this).apply {
                       hint = "Username (ไอดี)"
                       inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
-                      setText(saved.user)
                   }
                   val pass = EditText(this).apply {
                       hint = "Password (พาสเวิร์ด)"
                       inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
-                      setText(saved.pass)
                   }
                   val delay = EditText(this).apply {
                       hint = "เริ่มกดหลังเปิดเกม (วินาที)"
@@ -403,23 +433,73 @@ jobs:
                       setText(saved.delaySec.toString())
                   }
                   val delayLabel = TextView(this).apply {
-                      text = "ตั้งเวลารอให้เกมโหลดถึงหน้าแรก (เครื่องช้าใส่เยอะๆ เช่น 120)"
+                      text = "เวลารอให้เกมโหลดถึงหน้าแรก (เครื่องช้าใส่เยอะๆ เช่น 120)"
                       textSize = 12f
                   }
                   val remember = CheckBox(this).apply {
-                      text = "บันทึก user/pass ไว้ในเครื่อง"
+                      text = "บันทึกบัญชีนี้ลงรายการเมื่อกดเข้าเกม"
                       isChecked = saved.remember
                   }
                   val encrypt = CheckBox(this).apply {
                       text = "เข้ารหัสข้อมูลที่บันทึก (ถ้าไม่ติ๊ก จะเก็บเป็นข้อความธรรมดา)"
                       isChecked = saved.encrypt
                   }
-                  val clear = Button(this).apply {
-                      text = "ลบข้อมูลที่บันทึก"
+
+                  fun refresh(select: String?) {
+                      val names = listOf("— บัญชีใหม่ —") + accounts.map { it.user }
+                      spinner.adapter = ArrayAdapter(
+                          this@MainActivity, android.R.layout.simple_spinner_dropdown_item, names
+                      )
+                      val idx = accounts.indexOfFirst { it.user == select }
+                      spinner.setSelection(if (idx >= 0) idx + 1 else 0)
+                  }
+
+                  fun upsert(u: String, p: String) {
+                      val i = accounts.indexOfFirst { it.user == u }
+                      if (i >= 0) accounts[i] = Store.Account(u, p) else accounts.add(Store.Account(u, p))
+                  }
+
+                  spinner.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+                      override fun onItemSelected(parent: AdapterView<*>?, view: View?, pos: Int, id: Long) {
+                          if (pos <= 0) {
+                              user.setText("")
+                              pass.setText("")
+                          } else {
+                              val a = accounts[pos - 1]
+                              user.setText(a.user)
+                              pass.setText(a.pass)
+                          }
+                      }
+                      override fun onNothingSelected(parent: AdapterView<*>?) {}
+                  }
+                  refresh(saved.lastUser)
+
+                  val saveBtn = Button(this).apply {
+                      text = "บันทึกบัญชีนี้"
                       setOnClickListener {
-                          Store.clear(context)
-                          user.setText("")
-                          pass.setText("")
+                          val u = user.text.toString().trim()
+                          val p = pass.text.toString()
+                          if (u.isEmpty() || p.isEmpty()) {
+                              Toast.makeText(context, "กรอก user/pass ก่อน", Toast.LENGTH_SHORT).show()
+                              return@setOnClickListener
+                          }
+                          upsert(u, p)
+                          Store.saveAccounts(this@MainActivity, accounts, encrypt.isChecked)
+                          refresh(u)
+                          Toast.makeText(context, "บันทึกแล้ว", Toast.LENGTH_SHORT).show()
+                      }
+                  }
+                  val delBtn = Button(this).apply {
+                      text = "ลบบัญชีที่เลือก"
+                      setOnClickListener {
+                          val pos = spinner.selectedItemPosition
+                          if (pos <= 0) {
+                              Toast.makeText(context, "เลือกบัญชีที่จะลบก่อน", Toast.LENGTH_SHORT).show()
+                              return@setOnClickListener
+                          }
+                          accounts.removeAt(pos - 1)
+                          Store.saveAccounts(this@MainActivity, accounts, encrypt.isChecked)
+                          refresh(null)
                           Toast.makeText(context, "ลบแล้ว", Toast.LENGTH_SHORT).show()
                       }
                   }
@@ -428,17 +508,21 @@ jobs:
                       setOnClickListener { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }
                   }
                   val go = Button(this).apply {
-                      text = "2) เข้าเกม (สลับไปบัญชีนี้)"
+                      text = "2) เข้าเกม (สลับไปบัญชีที่เลือก)"
                       setOnClickListener {
-                          val u = user.text.toString()
+                          val u = user.text.toString().trim()
                           val p = pass.text.toString()
                           val d = (delay.text.toString().toIntOrNull() ?: 20).coerceIn(0, 600)
-                          Store.save(context, u, p, remember.isChecked, encrypt.isChecked, d)
 
-                          if (u.isBlank() || p.isBlank()) {
-                              Toast.makeText(context, "กรอก user/pass ก่อน", Toast.LENGTH_LONG).show()
+                          if (u.isEmpty() || p.isEmpty()) {
+                              Toast.makeText(context, "เลือกบัญชีหรือกรอก user/pass ก่อน", Toast.LENGTH_LONG).show()
                               return@setOnClickListener
                           }
+                          if (remember.isChecked) upsert(u, p)
+                          Store.saveAccounts(this@MainActivity, accounts, encrypt.isChecked)
+                          Store.saveSettings(this@MainActivity, remember.isChecked, d, u)
+                          refresh(u)
+
                           if (!isServiceEnabled()) {
                               Toast.makeText(context, "ต้องเปิดสิทธิ์ Accessibility ก่อน", Toast.LENGTH_LONG).show()
                               startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
@@ -455,11 +539,14 @@ jobs:
                       }
                   }
 
+                  val title = TextView(this).apply { text = "บัญชีที่บันทึกไว้"; textSize = 14f }
                   val box = LinearLayout(this).apply {
                       orientation = LinearLayout.VERTICAL
                       setPadding(48, 96, 48, 48)
+                      addView(title); addView(spinner)
                       addView(user); addView(pass); addView(delay); addView(delayLabel)
-                      addView(remember); addView(encrypt); addView(clear)
+                      addView(remember); addView(encrypt)
+                      addView(saveBtn); addView(delBtn)
                       addView(perm); addView(go)
                   }
                   setContentView(ScrollView(this).apply { addView(box) })
@@ -526,4 +613,3 @@ jobs:
         with:
           name: OpmLauncher-apk
           path: app/build/outputs/apk/debug/app-debug.apk
-  
