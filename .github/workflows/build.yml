@@ -1,0 +1,304 @@
+name: Build APK
+on:
+  workflow_dispatch:
+  push:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Generate project files
+        run: |
+          mkdir -p "$(dirname 'app/build.gradle.kts')"
+          cat > 'app/build.gradle.kts' <<'EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.example.opmlauncher"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.example.opmlauncher"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              kotlinOptions { jvmTarget = "17" }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+          }
+          dependencies {
+              implementation("androidx.appcompat:appcompat:1.7.0")
+              implementation("androidx.security:security-crypto:1.1.0-alpha06")
+          }
+          EOF
+          mkdir -p "$(dirname 'app/src/main/AndroidManifest.xml')"
+          cat > 'app/src/main/AndroidManifest.xml' <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <!-- ให้แอปมองเห็นเกมได้บน Android 11+ -->
+              <queries>
+                  <package android:name="com.onepunchman.ggplay.sea" />
+              </queries>
+
+              <application
+                  android:label="OPM Launcher"
+                  android:theme="@style/Theme.AppCompat.DayNight.DarkActionBar">
+
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".AutoLoginService"
+                      android:exported="true"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.accessibilityservice.AccessibilityService" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.accessibilityservice"
+                          android:resource="@xml/accessibility_config" />
+                  </service>
+              </application>
+          </manifest>
+          EOF
+          mkdir -p "$(dirname 'app/src/main/java/com/example/opmlauncher/AutoLoginService.kt')"
+          cat > 'app/src/main/java/com/example/opmlauncher/AutoLoginService.kt' <<'EOF'
+          package com.example.opmlauncher
+
+          import android.accessibilityservice.AccessibilityService
+          import android.os.Bundle
+          import android.util.Log
+          import android.view.accessibility.AccessibilityEvent
+          import android.view.accessibility.AccessibilityNodeInfo
+
+          class AutoLoginService : AccessibilityService() {
+
+              companion object {
+                  @Volatile var pendingUntil = 0L
+                  private const val TAG = "OpmAutoLogin"
+                  // คำที่ใช้หาปุ่มล็อกอิน/เข้าเกม (เพิ่มได้ตามที่เห็นในเกม)
+                  private val LOGIN_WORDS = listOf("login", "log in", "sign in", "เข้าสู่ระบบ", "ล็อกอิน", "登录", "登入")
+                  private val ENTER_WORDS = listOf("enter game", "start game", "เข้าเกม", "เริ่มเกม", "进入游戏")
+              }
+
+              private var lastRun = 0L
+              private var filled = false
+
+              override fun onAccessibilityEvent(event: AccessibilityEvent) {
+                  val now = System.currentTimeMillis()
+                  if (now > pendingUntil) { filled = false; return }
+                  if (event.packageName != Store.GAME_PACKAGE) return
+                  if (now - lastRun < 700) return
+                  lastRun = now
+
+                  val root = rootInActiveWindow ?: return
+                  val edits = mutableListOf<AccessibilityNodeInfo>()
+                  collectEditable(root, edits)
+
+                  // ขั้นที่ 1: กรอก user/pass แล้วกดล็อกอิน
+                  if (!filled && edits.size >= 2) {
+                      val p = Store.prefs(this)
+                      val passNode = edits.firstOrNull { it.isPassword } ?: edits[1]
+                      val userNode = edits.first { it != passNode }
+                      setText(userNode, p.getString("u", "") ?: "")
+                      setText(passNode, p.getString("p", "") ?: "")
+                      filled = true
+                      findByText(root, LOGIN_WORDS)?.let { clickNode(it) }
+                      return
+                  }
+
+                  // ขั้นที่ 2: หลังล็อกอินแล้ว หาปุ่ม "เข้าเกม"
+                  if (filled) {
+                      findByText(root, ENTER_WORDS)?.let {
+                          clickNode(it)
+                          pendingUntil = 0L   // เสร็จงาน
+                          filled = false
+                      }
+                      return
+                  }
+
+                  // ยังหา UI ไม่เจอ: พิมพ์โครงสร้างลง Logcat เพื่อใช้ปรับโค้ด
+                  dump(root, 0)
+              }
+
+              private fun collectEditable(n: AccessibilityNodeInfo, out: MutableList<AccessibilityNodeInfo>) {
+                  if (n.isEditable) out.add(n)
+                  for (i in 0 until n.childCount) n.getChild(i)?.let { collectEditable(it, out) }
+              }
+
+              private fun setText(n: AccessibilityNodeInfo, text: String) {
+                  val args = Bundle().apply {
+                      putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, text)
+                  }
+                  n.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
+              }
+
+              private fun findByText(n: AccessibilityNodeInfo, words: List<String>): AccessibilityNodeInfo? {
+                  val label = "${n.text ?: ""} ${n.contentDescription ?: ""}".lowercase()
+                  if (label.isNotBlank() && words.any { label.contains(it) }) return n
+                  for (i in 0 until n.childCount) {
+                      n.getChild(i)?.let { c -> findByText(c, words)?.let { return it } }
+                  }
+                  return null
+              }
+
+              private fun clickNode(n: AccessibilityNodeInfo) {
+                  var cur: AccessibilityNodeInfo? = n
+                  while (cur != null) {
+                      if (cur.isClickable) { cur.performAction(AccessibilityNodeInfo.ACTION_CLICK); return }
+                      cur = cur.parent
+                  }
+              }
+
+              private fun dump(n: AccessibilityNodeInfo, depth: Int) {
+                  Log.d(TAG, "${" ".repeat(depth)}${n.className} text=${n.text} desc=${n.contentDescription} edit=${n.isEditable} click=${n.isClickable}")
+                  for (i in 0 until n.childCount) n.getChild(i)?.let { dump(it, depth + 1) }
+              }
+
+              override fun onInterrupt() {}
+          }
+          EOF
+          mkdir -p "$(dirname 'app/src/main/java/com/example/opmlauncher/MainActivity.kt')"
+          cat > 'app/src/main/java/com/example/opmlauncher/MainActivity.kt' <<'EOF'
+          package com.example.opmlauncher
+
+          import android.content.Context
+          import android.content.Intent
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.text.InputType
+          import android.widget.Button
+          import android.widget.EditText
+          import android.widget.LinearLayout
+          import android.widget.Toast
+          import androidx.appcompat.app.AppCompatActivity
+          import androidx.security.crypto.EncryptedSharedPreferences
+          import androidx.security.crypto.MasterKey
+
+          object Store {
+              // เกมเวอร์ชัน SEA (ไทย). ถ้าใช้เวอร์ชันอื่น ให้แก้ตรงนี้ + ใน AndroidManifest + accessibility_config.xml
+              const val GAME_PACKAGE = "com.onepunchman.ggplay.sea"
+
+              fun prefs(c: Context) = EncryptedSharedPreferences.create(
+                  c, "creds",
+                  MasterKey.Builder(c).setKeyScheme(MasterKey.KeyScheme.AES256_GCM).build(),
+                  EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
+                  EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
+              )
+          }
+
+          class MainActivity : AppCompatActivity() {
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  val p = Store.prefs(this)
+
+                  val user = EditText(this).apply {
+                      hint = "Username"
+                      setText(p.getString("u", ""))
+                  }
+                  val pass = EditText(this).apply {
+                      hint = "Password"
+                      inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+                      setText(p.getString("p", ""))
+                  }
+                  val perm = Button(this).apply {
+                      text = "1) เปิดสิทธิ์ Accessibility (ทำครั้งเดียว)"
+                      setOnClickListener { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }
+                  }
+                  val go = Button(this).apply {
+                      text = "เข้าเกม"
+                      setOnClickListener {
+                          p.edit().putString("u", user.text.toString()).putString("p", pass.text.toString()).apply()
+
+                          if (!isServiceEnabled()) {
+                              Toast.makeText(context, "ต้องเปิดสิทธิ์ Accessibility ก่อน", Toast.LENGTH_LONG).show()
+                              startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+                              return@setOnClickListener
+                          }
+                          val intent = packageManager.getLaunchIntentForPackage(Store.GAME_PACKAGE)
+                          if (intent == null) {
+                              Toast.makeText(context, "ไม่พบเกมในเครื่อง", Toast.LENGTH_LONG).show()
+                              return@setOnClickListener
+                          }
+                          // ให้ service ทำงานต่อเนื่อง 90 วินาที
+                          AutoLoginService.pendingUntil = System.currentTimeMillis() + 90_000
+                          startActivity(intent)
+                      }
+                  }
+
+                  setContentView(LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(48, 96, 48, 48)
+                      addView(user); addView(pass); addView(perm); addView(go)
+                  })
+              }
+
+              private fun isServiceEnabled(): Boolean {
+                  val enabled = Settings.Secure.getString(
+                      contentResolver, Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES
+                  ) ?: return false
+                  return enabled.contains("$packageName/${AutoLoginService::class.java.name}")
+              }
+          }
+          EOF
+          mkdir -p "$(dirname 'app/src/main/res/values/strings.xml')"
+          cat > 'app/src/main/res/values/strings.xml' <<'EOF'
+          <resources>
+              <string name="service_desc">ใช้กรอก username/password และกดล็อกอินในเกมให้อัตโนมัติ เฉพาะเมื่อกดปุ่ม "เข้าเกม" จากแอปนี้</string>
+          </resources>
+          EOF
+          mkdir -p "$(dirname 'app/src/main/res/xml/accessibility_config.xml')"
+          cat > 'app/src/main/res/xml/accessibility_config.xml' <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityEventTypes="typeWindowStateChanged|typeWindowContentChanged"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:canRetrieveWindowContent="true"
+              android:packageNames="com.onepunchman.ggplay.sea"
+              android:notificationTimeout="300"
+              android:description="@string/service_desc" />
+          EOF
+          mkdir -p "$(dirname 'build.gradle.kts')"
+          cat > 'build.gradle.kts' <<'EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF
+          mkdir -p "$(dirname 'gradle.properties')"
+          cat > 'gradle.properties' <<'EOF'
+          android.useAndroidX=true
+          org.gradle.jvmargs=-Xmx2g
+          kotlin.code.style=official
+          EOF
+          mkdir -p "$(dirname 'settings.gradle.kts')"
+          cat > 'settings.gradle.kts' <<'EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "OpmLauncher"
+          include(":app")
+          EOF
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: android-actions/setup-android@v3
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+      - run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: OpmLauncher-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
